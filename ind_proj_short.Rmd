@@ -1,0 +1,667 @@
+---
+title: "Informative Bayesian priors in a clinical intervention study"
+subtitle: "Individual project for Bayesian Analysis and Decision Theory, Spring 2022"
+author: "Carl Delfin"
+date: "2022-02-15"
+output:
+    html_document:
+        self_contained: true
+        css: custom.css
+        highlight: pygments
+        code_folding: show
+        toc: true
+        number_sections: true
+---
+
+# Preparations
+
+## Libraries
+
+<div class = "code-block">
+```{r libraries}
+library(here)
+library(tidyverse)
+library(brms)
+library(rstan)
+library(emmeans)
+library(knitr)
+library(kableExtra)
+```
+</div>
+
+## Setup
+
+<div class = "code-block">
+```{r setup}
+# overwrite brms models?
+overwrite <- TRUE
+
+# brms settings
+refresh <- 0
+cores <- 4
+chains <- 4
+iter <- 4000
+warmup <- 1000
+
+# how large are our groups?
+n <- 25
+```
+</div>
+
+## Functions
+
+A few helper functions are necessary.
+
+<div class = "code-block">
+```{r functions}
+# sample from a truncated normal distribution
+# https://stats.stackexchange.com/a/510821
+rnormt <- function(n, range, mu, sigma) {
+  pnorm_min <- pnorm(min(range), mean = mu, sd = sigma)
+  pnorm_max <- pnorm(max(range), mean = mu, sd = sigma)
+  unif = runif(n, min = pnorm_min, max = pnorm_max)
+  qnorm(unif, mean = mu, sd = sigma)
+}
+
+# ggplot theme in line with LU colors
+theme_lu <- function() {
+    theme_classic() +
+    theme(plot.title = element_text(size = 14, color = "#202020"),
+          plot.subtitle = element_text(size = 11, color = "#202020"),
+          plot.caption = element_text(size = 11, color = "#202020"),
+          axis.text = element_text(size = 11, color = "#202020"),
+          axis.text.x = element_text(size = 11, color = "#202020"),
+          axis.text.y = element_text(size = 11, color = "#202020"),
+          legend.title = element_text(size = 11),
+          legend.text = element_text(size = 11),
+          panel.grid.major = element_line(color = "#bcbab4", size = 0.2),
+          panel.background = element_rect(fill = "#ebe9e2", color = "#ebe9e2"),
+          plot.background = element_rect(fill = "#ebe9e2", color = "#ebe9e2"),
+          strip.background = element_rect(fill = "#e7e6e4"),
+          strip.text = element_text(colour = "#202020"),
+          legend.key = element_rect(fill = NA, color = NA),
+          legend.background = element_rect(color = NA, fill = NA),
+          legend.position = "top")
+}
+
+# mimic emmeans output for rstan models
+# NOTE: this is not a generic function,
+# it will only work for models specified here
+rstan_emmeans <- function(model, type = "means") {
+    # gather posterior samples
+    post <- as.data.frame(model) %>%
+        dplyr::select(b_Intercept, `b[1]`, `b[2]`, `b[3]`, `b[4]`, `b[5]`)
+
+    # if type = 'means' then print means and 95% HDIs
+    if (type == "means") {
+        out <- rbind(mean_hdi(post[, 1]),
+                     mean_hdi(post[, 1] + post[, 2]),
+                     mean_hdi(post[, 1] + post[, 3]),
+
+                     mean_hdi(post[, 1] + post[, 4]),
+                     mean_hdi(post[, 1] + post[, 4] + post[, 2] + post[, 5]),
+                     mean_hdi(post[, 1] + post[, 4] + post[, 3] + post[, 6])) %>%
+        mutate(time = paste0("t", rep(1:3, times = 2)),
+               group = rep(c("control", "intervention"), each = 3, times = 1)) %>%
+        mutate_if(is.numeric, round, 2) %>%
+        dplyr::select(group, time, y, ymin, ymax)
+        print(out)
+
+    # if type = 'contrasts' then mimic emmeans pairs output,
+    # with estimated difference and 95% HDI
+    } else if (type == "contrasts") {
+        out <- rbind(mean_hdi(post[, 2]),
+                     mean_hdi(post[, 3]),
+                     mean_hdi(post[, 3] - post[, 2]),
+
+                     mean_hdi(post[, 5] + post[, 2]),
+                     mean_hdi(post[, 3] + post[, 6]),
+                     mean_hdi(post[, 6] - post[, 5] + post[, 3] - post[, 2])) %>%
+        mutate(contrast = rep(c("t2 - t1", "t3 - t1", "t3 - t2"), each = 1, times = 2),
+               group = rep(c("control", "intervention"), each = 3, times = 1)) %>%
+        mutate_if(is.numeric, round, 2) %>%
+        dplyr::select(group, contrast, y, ymin, ymax)
+        print(out)
+    } else {
+        stop("type must be one of 'means' or 'contrasts'")
+    }
+}
+```
+</div>
+
+# Data
+
+Let's simulate some data representing the *mean initial thinking time* (MITT) from the [Stockings of Cambridge](https://www.cambridgecognition.com/cantab/cognitive-tests/executive-function/stockings-of-cambridge-soc/) (SoC) task, a computerized variant of the famous [Tower of Hanoi](https://en.wikipedia.org/wiki/Tower_of_Hanoi) problem-solving task. In the SoC, participants are tasked with trying to copy a pattern of balls shown on the screen by moving one ball at a time between three "stockings". They are also asked to figure out a solution *before* starting to move any balls, and the time spent thinking about a solution before touching the screen is the MITT. In essence, the MITT is a measure of impulsivity or [disinhibition](https://en.wikipedia.org/wiki/Disinhibition), and the idea is that the intervention group receives some form of training that will improve their ability to think before acting.
+
+Based on a [previous study](https://www.frontiersin.org/articles/10.3389/fpsyt.2018.00310/full) of mine, it seems reasonable to assume that the average MITT in violent offenders is six seconds, with a standard deviation of five and with possible scores ranging from 0 to 30. To make group differences distinguishable yet somewhat realistic, we'll simulate data with an approximate effect size (Cohen's *d*) of 1 for the difference in MITT between T1 and T3 in the intervention group. Note that in order to keep simulated values within the specified range we must sample from a truncated normal distribution (`rnormt`), the code for which is available above.
+
+<div class = "code-block">
+```{r data}
+set.seed(2022)
+c1 <- round(rnormt(n, c(0, 30), 6, 5), 0)
+c2 <- c1 * 1.01 + rnormt(n, c(-3, 3), 0, 5)
+c3 <- c2 * 1.01 + rnormt(n, c(-3, 3), 0, 5)
+
+i1 <- round(rnormt(n, c(0, 30), 6, 5), 0)
+i2 <- i1 * 1.2 + rnormt(n, c(-3, 3), 0, 5)
+i3 <- i2 * 1.4 + rnormt(n, c(-3, 3), 0, 5)
+
+d <- data.frame(id = seq(1, n * 2, 1),
+                group = rep(c("control", "intervention"), each = n),
+                t1 = c(c1, i1),
+                t2 = c(c2, i2),
+                t3 = c(c3, i3)) %>%
+    mutate_if(is.numeric, round, 0) %>%
+    gather("time", "mitt", t1, t2, t3) %>%
+    # make sure there are no zero values for mitt
+    mutate(mitt = ifelse(mitt < 0, 1, mitt))
+```
+</div>
+<br>
+
+## Data format
+
+Here's what the first and last six rows of data look like:
+
+<div class = "code-block">
+```{r}
+head(d); tail(d)
+```
+</div>
+<br>
+
+## Visual overview
+
+Here's a visual overview of the simulated data:
+
+<div class = "code-block">
+```{r fig1, fig.height = 12, fig.width = 8, fig.align = "center", units = "cm"}
+d %>%
+  ggplot(aes(x = time, y = mitt, color = group, group = group)) +
+  geom_point() +
+  geom_line() +
+  coord_cartesian(ylim = c(0, 30)) +
+  labs(title = "Change across time for each individual in the simulated data",
+       subtitle = "(Colors refer to group, numbers refer to individual ID)",
+       y = "Mean initial thinking time (MITT) in seconds", x = "Timepoint",
+       color = "Group",
+       fill = "Group") +
+  facet_wrap(~ id, nrow = 10) +
+  scale_x_discrete(labels = c("T1", "T2", "T3")) +
+  scale_y_continuous(expand = c(0.1, 0.1)) +
+  scale_color_manual(labels = c("Control", "Intervention"), values = c("#000080", "#ff6735")) +
+  theme_lu()
+```
+</div>
+<br>
+
+## Means and SDs
+
+Here are means and standard deviations. These will serve as "ground truth" for model comparisons later on.
+
+<div class = "code-block">
+```{r, message = FALSE, warning = FALSE, class.source = "fold-hide"}
+means_and_sds <- d %>%
+    group_by(time, group) %>%
+    dplyr::summarise(mean = paste0(mean(mitt), " (", round(sd(mitt), 2), ")")) %>%
+    tidyr::spread(time, mean) %>%
+    as.data.frame() %>%
+    select(-group)
+
+means <- d %>%
+    na.omit() %>%
+    group_by(time, group) %>%
+    dplyr::summarise(mean = mean(mitt)) %>%
+    tidyr::spread(time, mean) %>%
+    as.data.frame()
+
+between_grp_diff <- means[2, 2:4] - means[1, 2:4]
+
+table_1 <- rbind(means_and_sds, round(between_grp_diff, 2))
+
+rownames(table_1) <- c("Control", "Intervention", "Between-group difference")
+table_1 %>%
+    kbl(caption = "Table 1. Means (SDs) and between-group differences for the simulated data.",
+        col.names = c("T1", "T2", "T3"),
+        full.width = FALSE) %>%
+    kable_styling(bootstrap_options = "condensed",
+                  font_size = 17)
+```
+</div>
+<br>
+
+<div class = "code-block">
+```{r, message = FALSE, warning = FALSE, class.source = "fold-hide"}
+table_2 <- data.frame(
+    t2_t1 = c(means[1, 3] - means[1, 2], means[2, 3] - means[2, 2]),
+    t3_t2 = c(means[1, 4] - means[1, 3], means[2, 4] - means[2, 3]),
+    t3_t1 = c(means[1, 4] - means[1, 2], means[2, 4] - means[2, 2]))
+rownames(table_2) <- c("Control", "Intervention")
+
+table_2 %>%
+    kbl(caption = "Table 2. Within-group differences for the simulated data.",
+        col.names = c("T2 minus T1", "T3 minus T2", "T3 minus T1"),
+        full.width = FALSE) %>%
+    kable_styling(bootstrap_options = "condensed",
+                  font_size = 17)
+```
+</div>
+<br>
+
+# Adding some chaos
+
+Clinical data is rarely perfect. Participants may drop out or provide extreme values. To add some chaos to our measurements, we'll randomly add some missing data, say, 30%, or 45 measurements. In addition, let's manually change two values to act as "outliers". These may be thought of participants that had unusually high or low MITT values at T3.
+
+<div class = "code-block">
+```{r}
+n_missing <- 45
+dm <- d
+set.seed(2022)
+dm[sample(150, n_missing), "mitt"] <- rep(NA, n_missing)
+
+dm[108, "mitt"] <- 64 # previously had 1
+dm[148, "mitt"] <- 1 # previously had 30
+```
+</div>
+<br>
+
+Now, participants 6 and 12 are completely missing. Maybe some technical difficulties made their data corrupt? Participants 8 and 48 were given very high and very low values at T3, respectively. In addition, relatively few participants now have complete data, with measurements at each timepoint. Here's what the new data looks like:
+
+<div class = "code-block">
+```{r fig3, fig.height = 12, fig.width = 8, fig.align = "center", units = "cm", warning = FALSE, message = FALSE}
+dm %>%
+  ggplot(aes(x = time, y = mitt, color = group, group = group)) +
+  geom_point() +
+  geom_line() +
+  coord_cartesian(ylim = c(0, 30)) +
+  labs(title = "Change across time for each individual, with missing data and outliers",
+       subtitle = "(Colors refer to group, numbers refer to individual ID)",
+       y = "Mean initial thinking time (MITT) in seconds", x = "Timepoint",
+       color = "Group",
+       fill = "Group") +
+  facet_wrap(~ id, nrow = 10) +
+  scale_x_discrete(labels = c("T1", "T2", "T3")) +
+  scale_y_continuous(expand = c(0.1, 0.1)) +
+  scale_color_manual(labels = c("Control", "Intervention"), values = c("#000080", "#ff6735")) +
+  theme_lu()
+```
+</div>
+<br>
+
+# Bayesian models
+
+Time to model!
+
+## m1
+
+Regular linear regression with *default* priors:
+
+<div class = "code-block">
+```{r}
+if (overwrite == TRUE) {
+    m1 <- brm(mitt ~ 1 + time * group,
+              data = dm,
+              family = gaussian,
+              seed = 2022,
+              refresh = refresh,
+              chains = chains,
+              cores = cores,
+              iter = iter,
+              warmup = warmup)
+    saveRDS(m1, here::here("tmp/m1.rds"))
+}
+
+m1 <- readRDS(here::here("tmp/m1.rds"))
+print(m1)
+```
+</div>
+<br>
+
+Estimated marginal means:
+
+<div class = "code-block">
+```{r}
+m1_em <- emmeans(m1, ~ time | group)
+summary(m1_em, point.est = "mean")
+summary(pairs(m1_em, type = "response", reverse = TRUE), point.est = "mean")
+```
+</div>
+<br>
+
+## m2
+
+Varying intercepts with *weakly informative* priors:
+
+<div class = "code-block">
+```{r}
+if (overwrite == TRUE) {
+    m2 <- brm(mitt ~ 1 + time * group + (1 | id),
+              data = dm,
+              family = gaussian,
+              prior = c(prior(normal(0, 10), class = "b"),
+                        prior(normal(6, 10), class = "Intercept"),
+                        prior(cauchy(0, 1), class = "sigma"),
+                        prior(cauchy(0, 1), class = "sd")),
+              seed = 2022,
+              refresh = refresh,
+              chains = chains,
+              cores = cores,
+              iter = iter,
+              warmup = warmup)
+    saveRDS(m2, here::here("tmp/m2.rds"))
+}
+
+m2 <- readRDS(here::here("tmp/m2.rds"))
+print(m2)
+```
+</div>
+<br>
+
+Estimated marginal means:
+
+<div class = "code-block">
+```{r}
+m2_em <- emmeans(m2, ~ time | group)
+summary(m2_em, point.est = "mean")
+summary(pairs(m2_em, type = "response", reverse = TRUE), point.est = "mean")
+```
+</div>
+<br>
+
+## m3
+
+Varying intercepts with *weakly informative* priors, a *lower bound* of zero on `Intercept` since MITT can't be negative, and a *robust response distribution* accounting for outliers:
+
+<div class = "code-block">
+```{r}
+if (overwrite == TRUE) {
+    m3_spec <- brm(mitt ~ 1 + time * group + (1 | id),
+                   data = dm,
+                   family = student,
+                   prior = c(prior(normal(0, 10), class = "b"),
+                             prior(normal(6, 10), class = "Intercept"),
+                             prior(cauchy(0, 1), class = "sigma"),
+                             prior(cauchy(0, 1), class = "sd")),
+                   empty = TRUE)
+
+    # must do this in stan code since brms doesn't accept lower bound on coefs
+    stan_code <- stancode(m3_spec)
+    stan_code <- gsub("real Intercept;", "real<lower=0> Intercept;", stan_code)
+    stan_data = make_standata(formula = mitt ~ 1 + time * group + (1 | id),
+                              data = dm,
+                              family = gaussian)
+
+    m3 <- stan(model_code = stan_code,
+               data = stan_data,
+               seed = 2022,
+               refresh = refresh,
+               chains = chains,
+               cores = cores,
+               iter = iter,
+               warmup = warmup)
+    saveRDS(m3, here::here("tmp/m3.rds"))
+}
+
+m3 <- readRDS(here::here("tmp/m3.rds"))
+print(m3, pars = c("b_Intercept", "b[1]", "b[2]", "b[3]", "b[4]", "b[5]"))
+```
+</div>
+<br>
+
+Estimated marginal means (using a custom function for `rstan` models, see above):
+
+<div class = "code-block">
+```{r}
+rstan_emmeans(m3, type = "means")
+rstan_emmeans(m3, type = "contrasts")
+```
+</div>
+<br>
+
+## m4
+
+Varying intercepts with *informative* priors on *within-group* differences, a *lower bound* of zero on `Intercept`, and a *robust response distribution* accounting for outliers:
+
+<div class = "code-block">
+```{r}
+if (overwrite == TRUE) {
+    m4_spec <- brm(mitt ~ 1 + time * group + (1 | id),
+                   stanvars = stanvar(scode = "real diff_t3_t2;
+                                               real diff_t2_t1;
+                                               real diff_t3_t1;
+                                               diff_t3_t2 = b[5] - b[4] + b[2] - b[1];
+                                               diff_t2_t1 = b[4] + b[1];
+                                               diff_t3_t1 = b[2] + b[5];",
+                                               block = "tparameters") +
+                   stanvar(scode = "target += normal_lpdf(diff_t3_t2 | 4, 4);
+                                    target += normal_lpdf(diff_t2_t1 | 1.5, 4);
+                                    target += normal_lpdf(diff_t3_t1 | 5, 4);",
+                           block = "model"),
+                   data = dm,
+                   family = student,
+                   prior = c(prior(normal(0, 10), class = "b"),
+                             prior(normal(10, 1), class = "Intercept"),
+                             prior(cauchy(0, 1), class = "sigma"),
+                             prior(cauchy(0, 1), class = "sd"),
+                             prior(gamma(2, 0.1), class = "nu")),
+                   empty = TRUE)
+
+    stan_code <- stancode(m4_spec)
+    stan_code <- gsub("real Intercept;", "real<lower=0> Intercept;", stan_code)
+    stan_data = make_standata(formula = mitt ~ 1 + time * group + (1 | id),
+                              data = dm,
+                              family = student)
+
+    m4 <- stan(model_code = stan_code,
+               data = stan_data,
+               seed = 2022,
+               refresh = refresh,
+               chains = chains,
+               cores = cores,
+               iter = iter,
+               warmup = warmup)
+    saveRDS(m4, here::here("tmp/m4.rds"))
+}
+
+m4 <- readRDS(here::here("tmp/m4.rds"))
+print(m4, pars = c("b_Intercept", "b[1]", "b[2]", "b[3]", "b[4]", "b[5]"))
+```
+</div>
+<br>
+
+Estimated marginal means:
+
+<div class = "code-block">
+```{r}
+rstan_emmeans(m4, type = "means")
+rstan_emmeans(m4, type = "contrasts")
+```
+</div>
+<br>
+
+## m5
+
+Varying intercepts with *informative* priors on *within-group* differences, a *lower bound* of zero on `Intercept`, a *robust response distribution* accounting for outliers, and *imputing missing data* using `mi()`:
+
+<div class = "code-block">
+```{r}
+if (overwrite == TRUE) {
+    m5_spec <- brm(mitt | mi() ~ 1 + time * group + (1 | id),
+                   stanvars = stanvar(scode = "real diff_t3_t2;
+                                               real diff_t2_t1;
+                                               real diff_t3_t1;
+                                               diff_t3_t2 = b[5] - b[4] + b[2] - b[1];
+                                               diff_t2_t1 = b[4] + b[1];
+                                               diff_t3_t1 = b[2] + b[5];",
+                                      block = "tparameters") +
+                   stanvar(scode = "target += normal_lpdf(diff_t3_t2 | 4, 4);
+                                    target += normal_lpdf(diff_t2_t1 | 1.5, 4);
+                                    target += normal_lpdf(diff_t3_t1 | 5, 4);",
+                           block = "model"),
+                   data = dm,
+                   family = student,
+                   prior = c(prior(normal(0, 10), class = "b"),
+                             prior(normal(10, 1), class = "Intercept"),
+                             prior(cauchy(0, 1), class = "sigma"),
+                             prior(cauchy(0, 1), class = "sd"),
+                             prior(gamma(2, 0.1), class = "nu")),
+                   empty = TRUE)
+
+    stan_code <- stancode(m5_spec)
+    stan_code <- gsub("real Intercept;", "real<lower=0> Intercept;", stan_code)
+    stan_data = make_standata(formula = mitt | mi() ~ 1 + time * group + (1 | id),
+                              data = dm,
+                              family = student)
+
+    m5 <- stan(model_code = stan_code,
+               data = stan_data,
+               seed = 2022,
+               refresh = refresh,
+               chains = chains,
+               cores = cores,
+               iter = iter,
+               warmup = warmup)
+    saveRDS(m5, here::here("tmp/m5.rds"))
+}
+
+m5 <- readRDS(here::here("tmp/m5.rds"))
+print(m5, pars = c("b_Intercept", "b[1]", "b[2]", "b[3]", "b[4]", "b[5]"))
+```
+</div>
+<br>
+
+Estimated marginal means:
+
+<div class = "code-block">
+```{r}
+rstan_emmeans(m5, type = "means")
+rstan_emmeans(m5, type = "contrasts")
+```
+</div>
+<br>
+
+# Model comparison
+
+<div class = "code-block">
+```{r, results = FALSE}
+m1_comp <- as.data.frame(summary(pairs(m1_em, type = "response", reverse = TRUE), point.est = "mean")) %>%
+    dplyr::rename(y = estimate, ymin = lower.HPD, ymax = upper.HPD) %>%
+    mutate(model = rep("m1", 6))
+
+m2_comp <- as.data.frame(summary(pairs(m2_em, type = "response", reverse = TRUE), point.est = "mean")) %>%
+    dplyr::rename(y = estimate, ymin = lower.HPD, ymax = upper.HPD) %>%
+    mutate(model = rep("m2", 6))
+
+m3_comp <- rstan_emmeans(m3, type = "contrasts") %>%
+    mutate(group = as.factor(group),
+           contrast = as.factor(contrast),
+           model = rep("m3", 6))
+
+m4_comp <- rstan_emmeans(m4, type = "contrasts") %>%
+    mutate(group = as.factor(group),
+           contrast = as.factor(contrast),
+           model = rep("m4", 6))
+
+m5_comp <- rstan_emmeans(m5, type = "contrasts") %>%
+    mutate(group = as.factor(group),
+           contrast = as.factor(contrast),
+           model = rep("m5", 6))
+
+comparisons <- rbind(m1_comp, m2_comp, m3_comp, m4_comp, m5_comp) %>%
+    mutate(model = as.factor(model))
+
+table_2
+
+p1_actual_c <- table_2[1, 1]
+p1_actual_i <- table_2[2, 1]
+
+p1 <- comparisons %>%
+    filter(contrast == "t2 - t1") %>%
+    ggplot(aes(x = model, y = y, color = group, fill = group)) +
+    geom_hline(yintercept = p1_actual_c, color = "#000080", alpha = 0.8, linetype = "dashed") +
+    geom_hline(yintercept = p1_actual_i, color = "#ff6735", alpha = 0.8, linetype = "dashed") +
+    geom_pointrange(aes(y = y, ymin = ymin, ymax = ymax), position = position_dodge(0.4)) +
+    scale_x_discrete(limits = rev(levels(comparisons$model))) +
+    scale_color_manual(labels = c("Control", "Intervention"), values = c("#000080", "#ff6735")) +
+    scale_fill_manual(labels = c("Control", "Intervention"), values = c("#000080", "#ff6735")) +
+    labs(title = "Change in mean initial thinking time",
+         subtitle = "Estimated within-group change in MITT from T2 to T3\nDashed lines show the actual differences from the original data",
+         color = "Group",
+         fill = "Group",) +
+    coord_flip() +
+    theme_lu()
+
+p2_actual_c <- table_2[1, 2]
+p2_actual_i <- table_2[2, 2]
+
+p2 <- comparisons %>%
+    filter(contrast == "t3 - t2") %>%
+    ggplot(aes(x = model, y = y, color = group, fill = group)) +
+    geom_hline(yintercept = p2_actual_c, color = "#000080", alpha = 0.8, linetype = "dashed") +
+    geom_hline(yintercept = p2_actual_i, color = "#ff6735", alpha = 0.8, linetype = "dashed") +
+    geom_pointrange(aes(y = y, ymin = ymin, ymax = ymax), position = position_dodge(0.4)) +
+    scale_x_discrete(limits = rev(levels(comparisons$model))) +
+    scale_color_manual(labels = c("Control", "Intervention"), values = c("#000080", "#ff6735")) +
+    scale_fill_manual(labels = c("Control", "Intervention"), values = c("#000080", "#ff6735")) +
+    labs(title = "Change in mean initial thinking time",
+         subtitle = "Estimated within-group change in MITT from T2 to T3\nDashed lines show the actual differences from the original data",
+         color = "Group",
+         fill = "Group",) +
+    coord_flip() +
+    theme_lu()
+
+p3_actual_c <- table_2[1, 3]
+p3_actual_i <- table_2[2, 3]
+
+p3 <- comparisons %>%
+    filter(contrast == "t3 - t1") %>%
+    ggplot(aes(x = model, y = y, color = group, fill = group)) +
+    geom_hline(yintercept = p3_actual_c, color = "#000080", alpha = 0.8, linetype = "dashed") +
+    geom_hline(yintercept = p3_actual_i, color = "#ff6735", alpha = 0.8, linetype = "dashed") +
+    geom_pointrange(aes(y = y, ymin = ymin, ymax = ymax), position = position_dodge(0.4)) +
+    scale_x_discrete(limits = rev(levels(comparisons$model))) +
+    scale_color_manual(labels = c("Control", "Intervention"), values = c("#000080", "#ff6735")) +
+    scale_fill_manual(labels = c("Control", "Intervention"), values = c("#000080", "#ff6735")) +
+    labs(title = "Change in mean initial thinking time",
+         subtitle = "Estimated within-group change in MITT from T2 to T3\nDashed lines show the actual differences from the original data",
+         y = "Estimated change in MITT (s)", x = "Timepoint",
+         color = "Group",
+         fill = "Group",) +
+    coord_flip() +
+    theme_lu()
+```
+</div>
+<br>
+
+## Estimated within-group change from T1 to T2
+
+Not much difference between `m1` and `m2`. Adding a robust likelihood (`m3`) seems to make quite a difference, however. Adding informative priors (`m4`) and multiple imputation (`m5`) did not change much, although the credible intervals may be a *tiny* bit smaller.
+
+<div class = "code-block">
+```{r, fig.height = 5, fig.width = 5, fig.align = "center", units = "cm"}
+p1
+```
+</div>
+<br>
+
+## Estimated within-group change from T2 to T3
+
+Here we can really see the impact of using a robust likelihood.
+
+<div class = "code-block">
+```{r, fig.height = 5, fig.width = 5, fig.align = "center", units = "cm"}
+p2
+```
+</div>
+<br>
+
+## Estimated within-group change from T1 to T3
+
+Again, the impact of a robust likelihood is evident, but the lower bound of the 95% CrI for `m5` is also closer to the actual difference for the intervention group, suggesting that multiple imputation and informative priors might have had an effect.
+
+<div class = "code-block">
+```{r, fig.height = 5, fig.width = 5, fig.align = "center", units = "cm"}
+p3
+```
+</div>
+<br>
